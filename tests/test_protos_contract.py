@@ -80,6 +80,17 @@ class TestProtosToml:
         declared = spec["wrapper"]["input_schema"]["properties"]["max_workers"]
         assert declared["maximum"] == MAX_WORKERS_CAP
 
+    @pytest.mark.parametrize(
+        "field", ["fail_fast", "max_workers", "result_detail", "max_result_bytes"]
+    )
+    def test_declared_defaults_match_the_batch_model(self, spec, field):
+        # A declared default that disagrees with the implementation is a
+        # lie the platform shows in its form and the copilot reasons from.
+        from cell_performance_batch.batch import BatchInput
+
+        declared = spec["wrapper"]["input_schema"]["properties"][field]["default"]
+        assert declared == BatchInput.model_fields[field].default
+
 
 class TestGeneratedStructs:
     """The full model structs must actually be in the TOML, and current.

@@ -17,7 +17,7 @@ import pytest
 from pydantic import ValidationError
 
 from cell_performance_batch import run_batch
-from cell_performance_batch.batch import COMPARISON_KEYS
+from cell_performance_batch.batch import COMPARISON_KEYS, RESULT_BYTE_BUDGET
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLE = json.loads((REPO_ROOT / "examples" / "two_designs.json").read_text())
@@ -162,6 +162,92 @@ class TestResultDetail:
         kpis = run_batch(example)["results"][0]["kpis"]
         assert set(kpis) == set(COMPARISON_KEYS)
         assert kpis["cell_nominal_capacity_Ah"] == 67.3
+
+
+class TestResultBudget:
+    """The result travels as one line of container stdout.
+
+    containerd splits log lines at 16 KiB, and the platform's reader
+    scans line by line for one that parses — so an oversized result
+    fails the run with "Could not find JSON result in pod output" even
+    though the container exited 0 and every design succeeded.
+    """
+
+    def _bulky(self, samples: int):
+        def fake(payload, progress_callback=None):
+            return {
+                "cell_nominal_capacity_Ah": 67.3,
+                "cell_mass_g": 1111.0,
+                "c3_discharge_timeseries": {
+                    "time_s": [float(i) for i in range(samples)],
+                    "voltage_V": [3.7] * samples,
+                },
+            }
+
+        return fake
+
+    def test_oversized_result_is_degraded_not_dropped(self, monkeypatch, example):
+        _stub_model(monkeypatch, self._bulky(2000))
+        example["result_detail"] = "full"
+        result = run_batch(example)
+
+        assert len(json.dumps(result)) <= example.get(
+            "max_result_bytes", RESULT_BYTE_BUDGET
+        )
+        # Degraded, not emptied: the KPIs a sweep is for are still here.
+        assert result["summary"]["succeeded"] == 2
+        assert result["results"][0]["kpis"]["cell_nominal_capacity_Ah"] == 67.3
+        assert result["summary"]["comparison"][1]["cell_mass_g"] == 1111.0
+
+    def test_truncation_is_declared_with_what_was_dropped(self, monkeypatch, example):
+        _stub_model(monkeypatch, self._bulky(2000))
+        example["result_detail"] = "full"
+        truncated = run_batch(example)["truncated"]
+
+        assert truncated["requested_result_detail"] == "full"
+        assert "kpis" in truncated["applied"]
+        assert truncated["original_size_bytes"] > truncated["budget_bytes"]
+        assert truncated["size_bytes"] <= truncated["budget_bytes"]
+        assert truncated["reason"] and truncated["hint"]
+
+    def test_a_result_that_already_fits_is_untouched(self, monkeypatch, example):
+        _stub_model(monkeypatch, lambda p, progress_callback=None: {"cell_mass_g": 1.0})
+        result = run_batch(example)
+
+        assert "truncated" not in result
+        assert result["summary"]["result_detail"] == "kpis"
+
+    def test_budget_zero_opts_out_entirely(self, monkeypatch, example):
+        _stub_model(monkeypatch, self._bulky(2000))
+        example["result_detail"] = "full"
+        example["max_result_bytes"] = 0
+        result = run_batch(example)
+
+        assert "truncated" not in result
+        assert len(json.dumps(result)) > RESULT_BYTE_BUDGET
+        assert "c3_discharge_timeseries" in result["results"][0]["kpis"]
+
+    def test_the_last_rungs_keep_the_run_reportable(self, monkeypatch, example):
+        # Budget too small for any per-design payload: the ladder must
+        # still return a parseable envelope with the run's outcome.
+        _stub_model(monkeypatch, self._bulky(2000))
+        example["result_detail"] = "full"
+        example["max_result_bytes"] = 600
+        result = run_batch(example)
+
+        assert result["summary"]["design_count"] == 2
+        assert result["summary"]["succeeded"] == 2
+        assert [r["status"] for r in result["results"]] == ["ok", "ok"]
+        assert all(r["kpis"] is None for r in result["results"])
+        assert "truncated" in result
+
+    @pytest.mark.slow()
+    def test_the_real_two_design_sweep_fits_by_default(self, example):
+        # The regression that produced the platform error: the shipped
+        # default must fit inside one log line for the bundled example.
+        example.pop("result_detail", None)
+        rendered = json.dumps(run_batch(example))
+        assert len(rendered) < 16 * 1024
 
 
 class TestComparisonTable:

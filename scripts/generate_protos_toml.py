@@ -195,7 +195,7 @@ def build_input_schema() -> dict[str, Any]:
             },
             "fail_fast": {
                 "type": "boolean",
-                "default": False,
+                "default": _default("fail_fast"),
                 "description": (
                     "Stop at the first failing design; the rest report "
                     "status 'skipped'."
@@ -203,7 +203,7 @@ def build_input_schema() -> dict[str, Any]:
             },
             "max_workers": {
                 "type": "integer",
-                "default": 1,
+                "default": _default("max_workers"),
                 "minimum": 1,
                 "maximum": MAX_WORKERS_CAP,
                 "description": (
@@ -213,15 +213,40 @@ def build_input_schema() -> dict[str, Any]:
             },
             "result_detail": {
                 "type": "string",
-                "default": "full",
+                "default": _default("result_detail"),
                 "enum": ["full", "kpis", "summary"],
                 "description": (
                     "full = every field; kpis = drop timeseries/experiments/"
-                    "BOM; summary = comparison scalars only."
+                    "BOM; summary = comparison scalars only. Defaults to "
+                    "'kpis' because 'full' outgrows the log-line transport "
+                    "at two designs."
+                ),
+            },
+            "max_result_bytes": {
+                "type": "integer",
+                "default": _default("max_result_bytes"),
+                "minimum": 0,
+                "description": (
+                    "Serialised size the result is degraded to fit, with "
+                    "what was dropped reported under 'truncated'. 0 "
+                    "disables the guard. The default keeps the result "
+                    "inside one container log line."
                 ),
             },
         },
     }
+
+
+def _default(field: str) -> Any:
+    """Read an envelope default off ``BatchInput``.
+
+    Hand-copying these is how the declared schema and the implementation
+    drift apart — the shipped ``result_detail`` default did exactly that
+    once already.
+    """
+    from cell_performance_batch.batch import BatchInput
+
+    return BatchInput.model_fields[field].default
 
 
 def build_output_schema() -> dict[str, Any]:

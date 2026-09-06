@@ -2227,9 +2227,15 @@ description = "Designs evaluated in parallel processes. >1 disables progress and
 
 [wrapper.input_schema.properties.result_detail]
 type = "string"
-default = "full"
+default = "kpis"
 enum = ["full", "kpis", "summary"]
-description = "full = every field; kpis = drop timeseries/experiments/BOM; summary = comparison scalars only."
+description = "full = every field; kpis = drop timeseries/experiments/BOM; summary = comparison scalars only. Defaults to 'kpis' because 'full' outgrows the log-line transport at two designs."
+
+[wrapper.input_schema.properties.max_result_bytes]
+type = "integer"
+default = 15000
+minimum = 0
+description = "Serialised size the result is degraded to fit, with what was dropped reported under 'truncated'. 0 disables the guard. The default keeps the result inside one container log line."
 
 [wrapper.output_schema]
 "$schema" = "http://json-schema.org/draft-07/schema#"

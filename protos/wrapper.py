@@ -23,6 +23,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+#: containerd / Docker split a single log line at 16 KiB. The result
+#: has to survive as one line, so anything above this is unparseable
+#: at the far end however cleanly the container exits.
+_LOG_LINE_SPLIT_BYTES = 16 * 1024
+
 # Fallback for an uninstalled checkout: <repo>/src on the path.
 _SRC = Path(__file__).resolve().parent.parent / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
@@ -88,7 +93,27 @@ def main() -> int:
         print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}))
         return 1
 
-    print(json.dumps(_json_safe(result), allow_nan=False, default=str))
+    rendered = json.dumps(_json_safe(result), allow_nan=False, default=str)
+
+    if result.get("truncated"):
+        print(
+            f"WARNING: result degraded to fit the log transport — "
+            f"{result['truncated']['applied']}",
+            file=sys.stderr,
+        )
+    if len(rendered) > _LOG_LINE_SPLIT_BYTES:
+        # Only reachable with max_result_bytes = 0. Say so plainly here,
+        # because the platform-side symptom ("Could not find JSON result
+        # in pod output") points nowhere near the cause.
+        print(
+            f"WARNING: result is {len(rendered):,} bytes on one line. "
+            f"Container runtimes split log lines at "
+            f"{_LOG_LINE_SPLIT_BYTES:,} bytes, and a split result cannot "
+            "be parsed by the platform.",
+            file=sys.stderr,
+        )
+
+    print(rendered)
     return 0
 
 

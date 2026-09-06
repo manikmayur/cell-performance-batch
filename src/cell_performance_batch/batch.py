@@ -22,6 +22,7 @@ container.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import traceback
@@ -62,6 +63,21 @@ _BULK_KEYS: tuple[str, ...] = (
 #: pods at 2 CPU / 4 GiB, and each PyBaMM process is memory-hungry, so
 #: fanning out further trades throughput for OOM kills.
 MAX_WORKERS_CAP = 4
+
+#: Default ceiling on the serialised result, in bytes.
+#:
+#: The result reaches Protos as a line of container stdout, and
+#: containerd splits any log line longer than 16 KiB into separate log
+#: entries. The platform's reader scans the log line by line for one
+#: that parses as JSON, so a split result surfaces as::
+#:
+#:     Could not find JSON result in pod output
+#:
+#: even though the container exited 0 and the sweep succeeded. 15 KB
+#: leaves headroom under the split for the JSON the wrapper adds around
+#: this payload. Set ``max_result_bytes = 0`` to opt out once the
+#: platform reassembles split lines.
+RESULT_BYTE_BUDGET = 15_000
 
 
 class DesignSpec(BaseModel):
@@ -125,11 +141,22 @@ class BatchInput(BaseModel):
         ),
     )
     result_detail: Literal["full", "kpis", "summary"] = Field(
-        "full",
+        "kpis",
         description=(
             "'full' = every upstream field; 'kpis' = drop timeseries, "
             "experiment results and the bill of materials; 'summary' = "
-            "only the comparison scalars."
+            "only the comparison scalars. Defaults to 'kpis' because "
+            "'full' outgrows the pod-log transport at two designs — see "
+            "max_result_bytes."
+        ),
+    )
+    max_result_bytes: int = Field(
+        RESULT_BYTE_BUDGET,
+        ge=0,
+        description=(
+            "Serialised size the result is degraded to fit, with what was "
+            "dropped reported under 'truncated'. 0 disables the guard. "
+            "The default keeps the result inside one container log line."
         ),
     )
 
@@ -177,7 +204,123 @@ def run_batch(
     else:
         results = _run_sequential(parsed, progress_callback)
 
-    return _envelope(results, parsed, elapsed_s=time.monotonic() - started)
+    envelope = _envelope(results, parsed, elapsed_s=time.monotonic() - started)
+    return shrink_to_budget(envelope, parsed.max_result_bytes)
+
+
+def shrink_to_budget(
+    envelope: dict[str, Any],
+    budget: int = RESULT_BYTE_BUDGET,
+) -> dict[str, Any]:
+    """Degrade ``envelope`` until it serialises within ``budget`` bytes.
+
+    A sweep that took minutes of solver time should come back reduced
+    rather than not at all, so this walks a ladder of increasingly
+    aggressive trims and stops at the first rung that fits. Whatever it
+    drops is reported under ``truncated`` — the caller is told what is
+    missing and how to get it back, which is the part that makes this
+    honest rather than lossy.
+
+    ``budget = 0`` disables the guard entirely.
+    """
+    if budget <= 0 or _sizeof(envelope) <= budget:
+        return envelope
+
+    original_detail = envelope["summary"]["result_detail"]
+    original_size = _sizeof(envelope)
+
+    for detail in ("kpis", "summary"):
+        if _detail_rank(detail) <= _detail_rank(original_detail):
+            continue
+        candidate = _redetail(envelope, detail)
+        if _sizeof(candidate) <= budget:
+            return _mark_truncated(
+                candidate,
+                applied=f"result_detail lowered to '{detail}'",
+                original_detail=original_detail,
+                original_size=original_size,
+                budget=budget,
+            )
+
+    # Still over: the design count, not the per-design payload, is what
+    # doesn't fit. Keep the comparison table — it is the one thing a
+    # sweep is actually for — and drop the per-design KPI blocks.
+    candidate = _drop_kpis(envelope)
+    if _sizeof(candidate) <= budget:
+        return _mark_truncated(
+            candidate,
+            applied="per-design kpis dropped; summary.comparison kept",
+            original_detail=original_detail,
+            original_size=original_size,
+            budget=budget,
+        )
+
+    # Last rung: counts and per-design status only.
+    candidate["summary"]["comparison"] = []
+    return _mark_truncated(
+        candidate,
+        applied="per-design kpis and summary.comparison both dropped",
+        original_detail=original_detail,
+        original_size=original_size,
+        budget=budget,
+    )
+
+
+_DETAIL_RANK = {"full": 0, "kpis": 1, "summary": 2}
+
+
+def _detail_rank(detail: str) -> int:
+    return _DETAIL_RANK.get(detail, 0)
+
+
+def _sizeof(payload: dict[str, Any]) -> int:
+    # Mirrors the wrapper's dump closely enough to size against: the
+    # only divergence is NaN -> null, worth one byte apiece.
+    return len(json.dumps(payload, default=str))
+
+
+def _redetail(envelope: dict[str, Any], detail: str) -> dict[str, Any]:
+    results = [
+        {**r, "kpis": _trim(r["kpis"], detail) if r["kpis"] else r["kpis"]}
+        for r in envelope["results"]
+    ]
+    summary = {**envelope["summary"], "result_detail": detail}
+    return {**envelope, "results": results, "summary": summary}
+
+
+def _drop_kpis(envelope: dict[str, Any]) -> dict[str, Any]:
+    results = [{**r, "kpis": None} for r in envelope["results"]]
+    summary = {**envelope["summary"], "result_detail": "none"}
+    return {**envelope, "results": results, "summary": summary}
+
+
+def _mark_truncated(
+    envelope: dict[str, Any],
+    *,
+    applied: str,
+    original_detail: str,
+    original_size: int,
+    budget: int,
+) -> dict[str, Any]:
+    envelope["truncated"] = {
+        "applied": applied,
+        "requested_result_detail": original_detail,
+        "original_size_bytes": original_size,
+        "size_bytes": _sizeof(envelope),
+        "budget_bytes": budget,
+        "reason": (
+            "The result is returned as a single line of container stdout, "
+            "and container runtimes split log lines at 16 KiB — a split "
+            "result reaches Protos as 'Could not find JSON result in pod "
+            "output'."
+        ),
+        "hint": (
+            "Split the sweep across runs to keep every design's data, or "
+            "raise max_result_bytes if the platform reassembles split log "
+            "lines."
+        ),
+    }
+    return envelope
 
 
 def _run_sequential(

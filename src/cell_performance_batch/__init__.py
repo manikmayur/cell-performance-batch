@@ -9,9 +9,11 @@ directly when you want one design without the array wrapper.
 from cell_performance_batch.batch import (
     COMPARISON_KEYS,
     MAX_WORKERS_CAP,
+    RESULT_BYTE_BUDGET,
     BatchInput,
     DesignSpec,
     run_batch,
+    shrink_to_budget,
 )
 
 #: protos-v2 commit the vendored ``cell_performance.py`` was taken from.
@@ -23,9 +25,11 @@ __version__ = "0.1.0"
 __all__ = [
     "COMPARISON_KEYS",
     "MAX_WORKERS_CAP",
+    "RESULT_BYTE_BUDGET",
     "UPSTREAM_COMMIT",
     "BatchInput",
     "DesignSpec",
     "__version__",
     "run_batch",
+    "shrink_to_budget",
 ]
