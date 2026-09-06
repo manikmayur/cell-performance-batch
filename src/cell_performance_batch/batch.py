@@ -79,6 +79,11 @@ MAX_WORKERS_CAP = 4
 #: platform reassembles split lines.
 RESULT_BYTE_BUDGET = 15_000
 
+#: Point budgets the shrink ladder tries, in order, before it gives up
+#: on curves and starts dropping fields. 48 keeps a discharge curve
+#: readable; 12 keeps its shape.
+TIMESERIES_LADDER: tuple[int, ...] = (48, 12)
+
 
 class DesignSpec(BaseModel):
     """One cell design in the batch.
@@ -150,6 +155,18 @@ class BatchInput(BaseModel):
             "max_result_bytes."
         ),
     )
+    timeseries_max_points: int | None = Field(
+        None,
+        ge=2,
+        description=(
+            "RDP-reduce every returned curve to at most this many points. "
+            "Applies to the C/3 discharge and to each experiment's "
+            "timeseries. Independent of "
+            "simulation_parameters.timeseries_rdp_epsilon, which sets the "
+            "tolerance the model subsamples at during the solve — this is "
+            "a hard bound on what comes back."
+        ),
+    )
     max_result_bytes: int = Field(
         RESULT_BYTE_BUDGET,
         ge=0,
@@ -205,6 +222,8 @@ def run_batch(
         results = _run_sequential(parsed, progress_callback)
 
     envelope = _envelope(results, parsed, elapsed_s=time.monotonic() - started)
+    if parsed.timeseries_max_points is not None:
+        envelope = _decimate(envelope, parsed.timeseries_max_points)
     return shrink_to_budget(envelope, parsed.max_result_bytes)
 
 
@@ -228,6 +247,27 @@ def shrink_to_budget(
 
     original_detail = envelope["summary"]["result_detail"]
     original_size = _sizeof(envelope)
+
+    # Rung one: keep the curves, lose resolution. The C/3 timeseries is
+    # ~70% of a 'full' result (5.5 KB of 7.9 KB per design) and every
+    # experiment carries another, so re-running RDP at a coarser
+    # tolerance buys most of the budget back while a two-design
+    # comparison still has curves to compare. Only worth trying while
+    # timeseries are still present at all.
+    if _detail_rank(original_detail) == 0:
+        for points in TIMESERIES_LADDER:
+            candidate = _decimate(envelope, points)
+            if _sizeof(candidate) <= budget:
+                return _mark_truncated(
+                    candidate,
+                    applied=(
+                        f"timeseries RDP-reduced to at most {points} points "
+                        "per curve"
+                    ),
+                    original_detail=original_detail,
+                    original_size=original_size,
+                    budget=budget,
+                )
 
     for detail in ("kpis", "summary"):
         if _detail_rank(detail) <= _detail_rank(original_detail):
@@ -277,6 +317,88 @@ def _sizeof(payload: dict[str, Any]) -> int:
     # Mirrors the wrapper's dump closely enough to size against: the
     # only divergence is NaN -> null, worth one byte apiece.
     return len(json.dumps(payload, default=str))
+
+
+def decimate_timeseries(block: dict[str, Any], max_points: int) -> dict[str, Any]:
+    """RDP-reduce one timeseries block to at most ``max_points`` samples.
+
+    Reuses the vendored model's own Ramer-Douglas-Peucker helper, so a
+    batch-decimated curve is subsampled by exactly the rule that
+    produced it in the first place — the model runs RDP at
+    ``simulation_parameters.timeseries_rdp_epsilon`` (1e-3 by default,
+    which is ~1 mV since the time axis dwarfs the voltage axis and the
+    perpendicular distance collapses to a vertical one).
+
+    The tolerance is doubled until the curve fits rather than solved
+    for: RDP's point count is a step function of epsilon, so there is
+    no closed form, and each pass over an already-subsampled curve is
+    microseconds.
+
+    Every parallel array is carried through the same row selection, so
+    the arrays stay index-aligned; endpoints always survive, which is
+    what keeps the start and end of the curve honest.
+    """
+    import numpy as np
+
+    from cell_performance_batch.cell_performance import _rdp_subsample
+
+    keys = [
+        key
+        for key, value in block.items()
+        if isinstance(value, list) and len(value) == len(block.get("time_s", []))
+    ]
+    # RDP measures distance on the first two columns, so the curve's own
+    # axes have to lead.
+    ordered = [k for k in ("time_s", "voltage_V") if k in keys]
+    ordered += [k for k in keys if k not in ordered]
+    if len(ordered) < 2 or len(block["time_s"]) <= max_points:
+        return block
+
+    data = np.column_stack([np.asarray(block[k], dtype=float) for k in ordered])
+
+    epsilon = 1e-3
+    reduced = data
+    for _ in range(60):
+        reduced = _rdp_subsample(data, epsilon)
+        if reduced.shape[0] <= max_points:
+            break
+        epsilon *= 2
+    else:  # pragma: no cover - RDP bottoms out at 2 points long before this
+        reduced = data[[0, -1], :]
+
+    decimated = dict(block)
+    for column, key in enumerate(ordered):
+        decimated[key] = [float(v) for v in reduced[:, column]]
+    return decimated
+
+
+def _is_timeseries_block(node: dict[str, Any]) -> bool:
+    return isinstance(node.get("time_s"), list) and bool(node["time_s"])
+
+
+def _decimate_node(node: Any, max_points: int) -> Any:
+    """Walk a result and decimate every timeseries block in it.
+
+    Recursive rather than reaching for known field names because
+    ``experiment_results`` nests one timeseries per experiment, and
+    those are the ones that actually get large — a multi-cycle
+    experiment concatenates every step.
+    """
+    if isinstance(node, dict):
+        if _is_timeseries_block(node):
+            return decimate_timeseries(node, max_points)
+        return {key: _decimate_node(value, max_points) for key, value in node.items()}
+    if isinstance(node, list):
+        return [_decimate_node(item, max_points) for item in node]
+    return node
+
+
+def _decimate(envelope: dict[str, Any], max_points: int) -> dict[str, Any]:
+    results = [
+        {**r, "kpis": _decimate_node(r["kpis"], max_points) if r["kpis"] else r["kpis"]}
+        for r in envelope["results"]
+    ]
+    return {**envelope, "results": results}
 
 
 def _redetail(envelope: dict[str, Any], detail: str) -> dict[str, Any]:

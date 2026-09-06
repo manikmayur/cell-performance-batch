@@ -45,7 +45,9 @@ one model run instead of N.
 | `simulation_parameters` | The protocol for every design that doesn't declare its own. Required unless all of them do. |
 | `fail_fast` | Stop at the first failure; the remaining designs come back as `status: "skipped"`. Ignored when `max_workers > 1`. |
 | `max_workers` | Designs per parallel process, capped at 4. `1` (default) is the only mode that reports progress. |
-| `result_detail` | `full` (everything) · `kpis` (drops timeseries, experiment results, BOM) · `summary` (comparison scalars only). |
+| `result_detail` | `full` (everything) · `kpis` (default; drops timeseries, experiment results, BOM) · `summary` (comparison scalars only). |
+| `timeseries_max_points` | RDP-reduce every returned curve to at most N points. Unset by default. |
+| `max_result_bytes` | Size the result is degraded to fit (15 KB default, `0` disables). See [Result size](#result-size). |
 
 `cell_parameters` and `simulation_parameters` are passed straight through
 to the vendored model and validated there — same fields, same units, same
@@ -164,6 +166,56 @@ committed file against a fresh render, field-for-field against the
 Pydantic models, and reproduces the platform's dry-run sample generator
 to confirm the generated schema still yields a runnable sample. Edit the
 models, re-run the generator, commit both.
+
+## Result size
+
+The result reaches Protos as **one line of container stdout**, and
+container runtimes split a log line at 16 KiB. The platform reads the
+log line by line looking for one that parses, so a result over that
+limit fails the run with `Could not find JSON result in pod output` —
+after the container exited 0 and the solve was paid for.
+
+Measured on the bundled two-design example:
+
+| Setting | Per design | Designs inside 16 KiB |
+|---|---|---|
+| `result_detail: "full"` | ~9.1 KB | 1 |
+| `full` + `timeseries_max_points: 12` | ~5.0 KB | 3 |
+| `result_detail: "kpis"` (default) | ~2.0 KB | 8 |
+| `result_detail: "summary"` | ~1.2 KB | 13 |
+
+The C/3 curve is ~70% of a `full` result (5.5 KB of 7.9 KB per design),
+and every experiment carries another one, so thinning curves is the
+cheapest thing to give up.
+
+`max_result_bytes` (15 KB default) enforces this rather than trusting
+it. An oversized result is degraded down a ladder and the first rung
+that fits wins:
+
+1. **RDP-reduce every curve** to 48 points, then to 12. Same
+   Ramer–Douglas–Peucker helper the model itself subsamples with, so a
+   thinned curve keeps its knees rather than becoming a chord.
+2. Lower `result_detail` — to `kpis`, then `summary`.
+3. Drop the per-design KPI blocks, keeping `summary.comparison`.
+4. Drop the comparison table too — counts and per-design status only.
+
+What was dropped, why, and how to get it back land in a `truncated`
+block on the result, and the wrapper warns on stderr. A sweep that cost
+minutes of solver time should come back reduced rather than not at all.
+Set `max_result_bytes: 0` to disable the guard once the platform
+reassembles split log lines
+([protos-v2#2482](https://github.com/arismachina/protos-v2/pull/2482)).
+
+Two separate RDP knobs, worth not confusing:
+
+- `simulation_parameters.timeseries_rdp_epsilon` (model, default `1e-3`)
+  is the tolerance used **during the solve**. Since the time axis dwarfs
+  the voltage axis, the perpendicular distance collapses to a vertical
+  one and the tolerance reads as roughly 1 mV — which already yields a
+  38-point C/3 curve, so there is less fat here than you would expect.
+- `timeseries_max_points` (this repo) is a **hard bound on what comes
+  back**, applied after the solve. Use it when you need a predictable
+  size; epsilon's point count is a step function you can't solve for.
 
 ### Runtime limits to design around
 

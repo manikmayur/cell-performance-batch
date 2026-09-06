@@ -222,6 +222,19 @@ def build_input_schema() -> dict[str, Any]:
                     "at two designs."
                 ),
             },
+            "timeseries_max_points": {
+                "type": "integer",
+                "minimum": 2,
+                "description": (
+                    "RDP-reduce every returned curve to at most this many "
+                    "points, including each experiment's timeseries. "
+                    "Independent of "
+                    "simulation_parameters.timeseries_rdp_epsilon, which "
+                    "sets the tolerance used during the solve — this is a "
+                    "hard bound on what comes back. Unset means no "
+                    "post-hoc reduction."
+                ),
+            },
             "max_result_bytes": {
                 "type": "integer",
                 "default": _default("max_result_bytes"),

@@ -17,7 +17,11 @@ import pytest
 from pydantic import ValidationError
 
 from cell_performance_batch import run_batch
-from cell_performance_batch.batch import COMPARISON_KEYS, RESULT_BYTE_BUDGET
+from cell_performance_batch.batch import (
+    COMPARISON_KEYS,
+    RESULT_BYTE_BUDGET,
+    decimate_timeseries,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLE = json.loads((REPO_ROOT / "examples" / "two_designs.json").read_text())
@@ -205,7 +209,7 @@ class TestResultBudget:
         truncated = run_batch(example)["truncated"]
 
         assert truncated["requested_result_detail"] == "full"
-        assert "kpis" in truncated["applied"]
+        assert truncated["applied"], "the rung taken must be named"
         assert truncated["original_size_bytes"] > truncated["budget_bytes"]
         assert truncated["size_bytes"] <= truncated["budget_bytes"]
         assert truncated["reason"] and truncated["hint"]
@@ -241,6 +245,74 @@ class TestResultBudget:
         assert all(r["kpis"] is None for r in result["results"])
         assert "truncated" in result
 
+    def _with_curve(self, samples: int):
+        """A design result whose curve dominates it, as 'full' really is."""
+
+        def fake(payload, progress_callback=None):
+            return {
+                "cell_nominal_capacity_Ah": 67.3,
+                "c3_discharge_timeseries": {
+                    "time_s": [float(i) for i in range(samples)],
+                    "voltage_V": [4.2 - 1.2 * i / samples for i in range(samples)],
+                    "current_A": [-22.0] * samples,
+                    "cc_capacity_Ah": 67.3,
+                },
+            }
+
+        return fake
+
+    def test_curves_are_thinned_before_they_are_abandoned(self, monkeypatch, example):
+        _stub_model(monkeypatch, self._with_curve(2000))
+        example["result_detail"] = "full"
+        result = run_batch(example)
+
+        curve = result["results"][0]["kpis"]["c3_discharge_timeseries"]
+        assert "RDP-reduced" in result["truncated"]["applied"]
+        assert len(curve["time_s"]) <= 48
+        # Thinned, not dropped: the curve is still there to compare.
+        assert len(curve["time_s"]) >= 2
+        assert result["summary"]["result_detail"] == "full"
+
+    def test_thinning_keeps_the_arrays_aligned_and_the_endpoints(
+        self, monkeypatch, example
+    ):
+        _stub_model(monkeypatch, self._with_curve(2000))
+        example["result_detail"] = "full"
+        curve = run_batch(example)["results"][0]["kpis"]["c3_discharge_timeseries"]
+
+        n = len(curve["time_s"])
+        assert len(curve["voltage_V"]) == n
+        assert len(curve["current_A"]) == n
+        assert curve["time_s"][0] == 0.0
+        assert curve["time_s"][-1] == 1999.0
+        assert curve["voltage_V"][0] == pytest.approx(4.2)
+        # Scalars riding along in the block are untouched.
+        assert curve["cc_capacity_Ah"] == 67.3
+
+    def test_thinning_falls_through_when_curves_are_not_the_problem(
+        self, monkeypatch, example
+    ):
+        # An oversized result with no timeseries in it at all: the
+        # ladder must move on to dropping fields rather than stalling on
+        # a rung that cannot help.
+        def fake(payload, progress_callback=None):
+            return {
+                "cell_nominal_capacity_Ah": 67.3,
+                "bill_of_materials": {
+                    "items": [
+                        {"name": f"component-{i}", "mass_g": float(i)}
+                        for i in range(300)
+                    ]
+                },
+            }
+
+        _stub_model(monkeypatch, fake)
+        example["result_detail"] = "full"
+        result = run_batch(example)
+
+        assert "kpis" in result["truncated"]["applied"]
+        assert "bill_of_materials" not in result["results"][0]["kpis"]
+
     @pytest.mark.slow()
     def test_the_real_two_design_sweep_fits_by_default(self, example):
         # The regression that produced the platform error: the shipped
@@ -248,6 +320,78 @@ class TestResultBudget:
         example.pop("result_detail", None)
         rendered = json.dumps(run_batch(example))
         assert len(rendered) < 16 * 1024
+
+
+class TestTimeseriesDecimation:
+    def _block(self, samples: int) -> dict:
+        return {
+            "time_s": [float(i) for i in range(samples)],
+            "voltage_V": [4.2 - 1.2 * i / samples for i in range(samples)],
+            "temperature_K": [298.15 + i / samples for i in range(samples)],
+            "total_capacity_Ah": 67.3,
+        }
+
+    def test_respects_the_point_budget(self):
+        for budget in (2, 5, 20, 100):
+            reduced = decimate_timeseries(self._block(1000), budget)
+            assert 2 <= len(reduced["time_s"]) <= budget
+
+    def test_a_short_curve_is_returned_untouched(self):
+        block = self._block(10)
+        assert decimate_timeseries(block, 48) is block
+
+    def test_keeps_the_shape_not_just_the_ends(self):
+        # RDP should spend its budget on the knee of the curve. A curve
+        # with a sharp bend must retain a point near the bend rather
+        # than degenerating to a straight chord.
+        samples = 500
+        block = {
+            "time_s": [float(i) for i in range(samples)],
+            "voltage_V": [4.2 if i < samples // 2 else 3.0 for i in range(samples)],
+        }
+        reduced = decimate_timeseries(block, 8)
+        assert 4.2 in reduced["voltage_V"]
+        assert 3.0 in reduced["voltage_V"]
+        knee = [
+            t
+            for t, v in zip(reduced["time_s"], reduced["voltage_V"], strict=True)
+            if abs(t - samples / 2) < samples * 0.05
+        ]
+        assert knee, "the bend in the curve was thinned away"
+
+    def test_reaches_timeseries_nested_under_experiments(self, monkeypatch, example):
+        def fake(payload, progress_callback=None):
+            curve = self._block(1000)
+            return {
+                "cell_nominal_capacity_Ah": 67.3,
+                "experiment_results": {"rpt": {"timeseries": curve, "cycles": []}},
+            }
+
+        _stub_model(monkeypatch, fake)
+        example["result_detail"] = "full"
+        example["timeseries_max_points"] = 10
+        result = run_batch(example)
+
+        nested = result["results"][0]["kpis"]["experiment_results"]["rpt"]["timeseries"]
+        assert len(nested["time_s"]) <= 10
+
+    def test_explicit_budget_applies_without_any_size_pressure(
+        self, monkeypatch, example
+    ):
+        _stub_model(
+            monkeypatch,
+            lambda p, progress_callback=None: {
+                "c3_discharge_timeseries": self._block(300)
+            },
+        )
+        example["result_detail"] = "full"
+        example["timeseries_max_points"] = 6
+        example["max_result_bytes"] = 0  # no budget pressure at all
+        result = run_batch(example)
+
+        curve = result["results"][0]["kpis"]["c3_discharge_timeseries"]
+        assert len(curve["time_s"]) <= 6
+        assert "truncated" not in result
 
 
 class TestComparisonTable:

@@ -80,6 +80,16 @@ class TestProtosToml:
         declared = spec["wrapper"]["input_schema"]["properties"]["max_workers"]
         assert declared["maximum"] == MAX_WORKERS_CAP
 
+    def test_every_envelope_field_is_declared(self, spec):
+        # The generator hand-builds the envelope, so a field added to
+        # BatchInput reaches the platform only if it is added here too.
+        # Both max_result_bytes and timeseries_max_points were missed
+        # this way before this test existed.
+        from cell_performance_batch.batch import BatchInput
+
+        declared = set(spec["wrapper"]["input_schema"]["properties"])
+        assert set(BatchInput.model_fields) <= declared
+
     @pytest.mark.parametrize(
         "field", ["fail_fast", "max_workers", "result_detail", "max_result_bytes"]
     )

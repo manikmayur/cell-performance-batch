@@ -2231,6 +2231,11 @@ default = "kpis"
 enum = ["full", "kpis", "summary"]
 description = "full = every field; kpis = drop timeseries/experiments/BOM; summary = comparison scalars only. Defaults to 'kpis' because 'full' outgrows the log-line transport at two designs."
 
+[wrapper.input_schema.properties.timeseries_max_points]
+type = "integer"
+minimum = 2
+description = "RDP-reduce every returned curve to at most this many points, including each experiment's timeseries. Independent of simulation_parameters.timeseries_rdp_epsilon, which sets the tolerance used during the solve — this is a hard bound on what comes back. Unset means no post-hoc reduction."
+
 [wrapper.input_schema.properties.max_result_bytes]
 type = "integer"
 default = 15000
